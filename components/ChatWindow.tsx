@@ -1,17 +1,28 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
-import { Send, Bot, User } from "lucide-react";
+import { useState, useRef, useEffect, useCallback, useImperativeHandle, forwardRef } from "react";
+import { Send, Bot, User, Clock } from "lucide-react";
 import { AgentSteps, Step } from "./AgentSteps";
 import { ItemCard } from "./ProductCard";
 import { Product, ServiceOffering } from "@/lib/data";
 
-type Message = {
+export type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
   steps?: Step[];
   matchedItems?: (Product | ServiceOffering)[];
+  /** Customer is waiting on the owner; shown as a hold chip under the bubble. */
+  awaiting?: boolean;
+  /** Reached the customer only after the owner approved it. */
+  ownerApproved?: boolean;
+};
+
+export type ChatHandle = {
+  /** Deliver a message the owner approved or wrote. */
+  pushOwnerMessage: (text: string) => void;
+  /** Clear the hold chip once the owner has acted. */
+  clearAwaiting: () => void;
 };
 
 const PRODUCT_QUICK: Record<string, string[]> = {
@@ -23,25 +34,29 @@ const PRODUCT_QUICK: Record<string, string[]> = {
 };
 
 const SERVICE_QUICK: Record<string, string[]> = {
-  svc1: ["I've spotted rats in my kitchen", "How quickly can you treat a wasp nest?", "I think I have bed bugs", "What does a pest survey include?"],
-  svc2: ["Install a home EV charger", "Do I qualify for the OZEV grant?", "How long does installation take?", "What charger brands do you supply?"],
-  svc3: ["Book a weekly cleaner", "What's included in a deep clean?", "I need end of tenancy cleaning", "Do you work weekends?"],
-  svc4: ["I need a man and van this weekend", "Moving a 3-bed house next month", "Do you provide packing boxes?", "Can you move a piano?"],
-  svc5: ["How much does solar installation cost?", "Do I need planning permission?", "How much will I save?", "Book a free solar survey"],
+  svc1: ["I've got rats in my kitchen, how much?", "Quote me for wasp nest removal", "I think I have bed bugs", "Do you treat pigeons on a roof?"],
+  svc2: ["Quote me for a home EV charger", "Do I qualify for the OZEV grant?", "How long does installation take?", "Can you install at a listed building?"],
+  svc3: ["How much for end of tenancy cleaning?", "Quote a weekly cleaner for a 2-bed", "What's included in a deep clean?", "Can you clean a hoarder property?"],
+  svc4: ["Quote a 3-bed house move", "I need a man and van this weekend", "Do you provide packing boxes?", "Can you move a grand piano?"],
+  svc5: ["How much for solar panels?", "Quote me for panels and a battery", "Do I need planning permission?", "Can you install on a thatched roof?"],
 };
 
 const WELCOME: Record<string, string> = {
   product: "Hi! Ask me anything about our products — availability, pricing, sizes, returns, or recommendations.",
-  service: "Hi! I can help you understand our services, check availability, and get you a quote. What do you need?",
+  service: "Hi! Tell me what you need and I'll get you a price. I'll ask a few questions first so the quote is accurate.",
 };
 
-export function ChatWindow({
-  mode,
-  bizId,
-}: {
+type Props = {
   mode: "product" | "service";
   bizId: string;
-}) {
+  onQuote?: (q: { serviceName: string; answers: Record<string, string>; lines: { label: string; amount: number }[]; total: number; notes?: string }) => void;
+  onEscalation?: (e: { question: string; reason: string }) => void;
+};
+
+export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
+  { mode, bizId, onQuote, onEscalation },
+  ref
+) {
   const [messages, setMessages] = useState<Message[]>([
     { id: "welcome", role: "assistant", content: WELCOME[mode] },
   ]);
@@ -53,6 +68,18 @@ export function ChatWindow({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useImperativeHandle(ref, () => ({
+    pushOwnerMessage: (text: string) => {
+      setMessages(prev => [
+        ...prev.map(m => ({ ...m, awaiting: false })),
+        { id: `owner-${Date.now()}`, role: "assistant", content: text, ownerApproved: true },
+      ]);
+    },
+    clearAwaiting: () => {
+      setMessages(prev => prev.map(m => ({ ...m, awaiting: false })));
+    },
+  }), []);
 
   const quickPrompts = mode === "product"
     ? (PRODUCT_QUICK[bizId] ?? [])
@@ -82,9 +109,7 @@ export function ChatWindow({
         signal: abortRef.current.signal,
       });
 
-      if (!res.ok || !res.body) {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -100,17 +125,17 @@ export function ChatWindow({
 
         for (const line of lines) {
           if (!line.startsWith("data: ")) continue;
-          const raw = line.slice(6).trim();
-          if (!raw) continue;
+          const rawLine = line.slice(6).trim();
+          if (!rawLine) continue;
           try {
-            const event = JSON.parse(raw);
+            const event = JSON.parse(rawLine);
 
             if (event.type === "step") {
               setMessages(prev => prev.map(m => {
                 if (m.id !== assistantId) return m;
                 const newStep: Step = {
                   id: event.id,
-                  type: event.stepType,   // ← fix: use stepType not type
+                  type: event.stepType,
                   label: event.label,
                   detail: event.detail,
                   status: event.status,
@@ -125,6 +150,16 @@ export function ChatWindow({
               setMessages(prev => prev.map(m =>
                 m.id === assistantId ? { ...m, matchedItems: event.items } : m
               ));
+            } else if (event.type === "quote") {
+              onQuote?.(event.quote);
+              setMessages(prev => prev.map(m =>
+                m.id === assistantId ? { ...m, awaiting: true } : m
+              ));
+            } else if (event.type === "escalation") {
+              onEscalation?.(event.escalation);
+              setMessages(prev => prev.map(m =>
+                m.id === assistantId ? { ...m, awaiting: true } : m
+              ));
             } else if (event.type === "content") {
               setMessages(prev => prev.map(m =>
                 m.id === assistantId ? { ...m, content: event.text } : m
@@ -135,7 +170,7 @@ export function ChatWindow({
               ));
             }
           } catch {
-            // malformed JSON line — skip
+            // malformed SSE line — skip
           }
         }
       }
@@ -148,7 +183,7 @@ export function ChatWindow({
     } finally {
       setLoading(false);
     }
-  }, [loading, messages, mode, bizId]);
+  }, [loading, messages, mode, bizId, onQuote, onEscalation]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -159,29 +194,27 @@ export function ChatWindow({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
         {messages.map(msg => (
           <div
             key={msg.id}
             className={`flex gap-3 msg-in ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}
           >
-            {/* Avatar */}
             <div
               className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5"
               style={{
-                background: msg.role === "assistant" ? "var(--accent-dim)" : "var(--surface-2)",
+                background: msg.role === "assistant"
+                  ? (msg.ownerApproved ? "var(--green-dim)" : "var(--accent-dim)")
+                  : "var(--surface-2)",
                 border: "1px solid var(--border)",
               }}
             >
               {msg.role === "assistant"
-                ? <Bot size={14} style={{ color: "var(--accent)" }} />
+                ? <Bot size={14} style={{ color: msg.ownerApproved ? "var(--green)" : "var(--accent)" }} />
                 : <User size={14} style={{ color: "var(--text-muted)" }} />}
             </div>
 
-            {/* Content */}
-            <div className={`flex flex-col gap-2 ${msg.role === "user" ? "items-end max-w-[78%]" : "items-start max-w-[82%]"}`}>
-              {/* Agent process steps */}
+            <div className={`flex flex-col gap-2 ${msg.role === "user" ? "items-end max-w-[78%]" : "items-start max-w-[85%]"}`}>
               {msg.role === "assistant" && msg.steps && msg.steps.length > 0 && (
                 <div
                   className="rounded-lg px-3 py-2.5 w-full"
@@ -194,14 +227,24 @@ export function ChatWindow({
                 </div>
               )}
 
-              {/* Bubble */}
+              {msg.ownerApproved && (
+                <span
+                  className="text-[9px] font-semibold tracking-widest px-1.5 py-0.5 rounded"
+                  style={{ background: "var(--green-dim)", color: "var(--green)" }}
+                >
+                  APPROVED BY OWNER
+                </span>
+              )}
+
               {msg.content ? (
                 <div
-                  className="rounded-lg px-3.5 py-2.5 text-sm leading-relaxed"
+                  className="rounded-lg px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap"
                   style={{
                     background: msg.role === "user" ? "var(--accent)" : "var(--surface-2)",
                     color: msg.role === "user" ? "#fff" : "var(--text)",
-                    border: msg.role === "user" ? "none" : "1px solid var(--border)",
+                    border: msg.role === "user"
+                      ? "none"
+                      : `1px solid ${msg.ownerApproved ? "#22c55e55" : "var(--border)"}`,
                   }}
                 >
                   {msg.content}
@@ -217,7 +260,16 @@ export function ChatWindow({
                 </div>
               ) : null}
 
-              {/* Matched items */}
+              {msg.awaiting && (
+                <span
+                  className="text-[10px] flex items-center gap-1 px-2 py-1 rounded-full"
+                  style={{ background: "var(--amber-dim)", color: "var(--amber)" }}
+                >
+                  <Clock size={9} className="thinking-dot" />
+                  Awaiting confirmation from the team
+                </span>
+              )}
+
               {msg.matchedItems && msg.matchedItems.length > 0 && (
                 <div className="flex flex-col gap-2 w-full">
                   <p className="text-[9px] font-semibold tracking-widest" style={{ color: "var(--text-muted)" }}>
@@ -234,7 +286,6 @@ export function ChatWindow({
         <div ref={bottomRef} />
       </div>
 
-      {/* Quick prompts */}
       {showQuickPrompts && (
         <div className="px-4 pb-2 flex flex-wrap gap-2">
           {quickPrompts.map(p => (
@@ -242,11 +293,7 @@ export function ChatWindow({
               key={p}
               onClick={() => sendMessage(p)}
               className="text-xs px-2.5 py-1.5 rounded-full transition-colors hover:opacity-80"
-              style={{
-                background: "var(--surface-2)",
-                border: "1px solid var(--border)",
-                color: "var(--text-muted)",
-              }}
+              style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-muted)" }}
             >
               {p}
             </button>
@@ -254,7 +301,6 @@ export function ChatWindow({
         </div>
       )}
 
-      {/* Input bar */}
       <form
         onSubmit={handleSubmit}
         className="p-3 flex gap-2 items-center"
@@ -264,12 +310,8 @@ export function ChatWindow({
           value={input}
           onChange={e => setInput(e.target.value)}
           placeholder={mode === "product" ? "Ask about a product…" : "Describe what you need…"}
-          className="flex-1 rounded-lg px-3.5 py-2.5 text-sm outline-none"
-          style={{
-            background: "var(--surface-2)",
-            border: "1px solid var(--border)",
-            color: "var(--text)",
-          }}
+          className="flex-1 min-w-0 rounded-lg px-3.5 py-2.5 text-sm outline-none"
+          style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text)" }}
           disabled={loading}
           autoFocus
         />
@@ -284,4 +326,4 @@ export function ChatWindow({
       </form>
     </div>
   );
-}
+});

@@ -1,6 +1,6 @@
 "use client";
 
-import { CheckCircle2, Circle, Loader2, Search, Cpu, Target, DollarSign, MessageSquare, AlertTriangle } from "lucide-react";
+import { CheckCircle2, Circle, Loader2, Search, Cpu, Target, DollarSign, MessageSquare, AlertTriangle, ClipboardList } from "lucide-react";
 
 export type Step = {
   id: string;
@@ -14,6 +14,7 @@ const ICONS: Record<string, React.ElementType> = {
   thinking: Cpu,
   searching: Search,
   matching: Target,
+  qualifying: ClipboardList,
   pricing: DollarSign,
   responding: MessageSquare,
   escalating: AlertTriangle,
