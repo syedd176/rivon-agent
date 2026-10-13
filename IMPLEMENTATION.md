@@ -100,14 +100,14 @@ the company operating it.
 | Framework | Next.js 16 (App Router, Turbopack) | One deployable holds both the UI and the API. No separate backend to host. |
 | Language | TypeScript | The catalogue shapes are the contract between the API and the UI; the compiler enforces them. |
 | Styling | Tailwind 4 + CSS custom properties | Tokens in `globals.css`, so the palette is defined once. |
-| LLM | Google Gemini (`gemini-3.8-flash`) | Fast and cheap for short conversational replies. Falls back to two other models. |
+| LLM | OpenAI `gpt-4.1-mini` | Cheap and fast for short replies. Real `system` role enables prefix caching; JSON mode guarantees the action schema parses. Falls back to `gpt-4.1-nano`. |
 | Hosting | Vercel | Native Next.js target; the API route deploys as a serverless function with no config. |
 | Icons | lucide-react | — |
 
 **There is no database.** Catalogues are a TypeScript module. §7 explains why
 that was the right call for this stage and what replaces it later.
 
-**Secrets.** `GEMINI_API_KEY` is a server-side Vercel environment variable. It
+**Secrets.** `OPENAI_API_KEY` is a server-side Vercel environment variable. It
 is read only inside the API route, never prefixed `NEXT_PUBLIC_`, and never
 reaches the browser. `.env.local` is gitignored; no key is committed.
 
@@ -163,21 +163,34 @@ and a step additionally has a `stepType` (`thinking`, `searching`, `matching`,
 `pricing`, `responding`). **These are two different fields on purpose**, and
 conflating them was one of the two bugs described in §6.
 
-### 4.4 Call Gemini, with fallback
+### 4.4 Call the model, with fallback
 
-Flash models return `503` under load. A single failed call would look to the
-customer like the agent is broken. So `generateWithFallback` tries three models
-in order, with one retry each:
+A rate-limited call would look to the customer like the agent is broken, so
+`generateWithFallback` tries two models in order:
 
 ```
-gemini-3.8-flash → gemini-flash-latest → gemini-2.5-flash
+gpt-4.1-mini → gpt-4.1-nano
 ```
 
-A `404` (model retired) breaks out of the retry loop immediately and moves to
-the next model, because retrying a model that no longer exists is pointless.
+The retry distinguishes load from our own mistakes. A `429` is worth retrying
+and worth falling back for. A `400`, `401` or `404` is a malformed request, a
+bad key or a wrong model name — the second model will reject it identically, so
+those throw immediately rather than burning a second call.
 
-If everything fails, the customer sees plain language — "the AI service is busy,
-send that again" — while the real error goes to `console.error` and lands in
+Three choices here are about cost, since the catalogue dominates every request:
+
+- **The catalogue sits in a real `system` message**, first and unchanged for the
+  whole conversation, so OpenAI's automatic prefix caching covers it on every
+  turn after the first.
+- **Only the last 8 turns are sent.** The system prompt already carries the
+  catalogue, and a service conversation is short qualification exchanges, so
+  older turns cost tokens without informing the reply.
+- **`max_tokens` is 500**, which comfortably fits replies the prompt already
+  caps at 130 words.
+
+If everything fails, the customer sees plain language — rate limits and
+misconfiguration get different messages, since one is worth retrying and the
+other needs a human. The real error goes to `console.error` and lands in
 Vercel's runtime logs. §6 shows why that logging mattered.
 
 ### 4.5 Owner approval — how a price actually reaches a customer
@@ -226,10 +239,13 @@ customer directly, under the same approval badge.
 the model write normally and regex out any `£` figures. That fails in both
 directions — it misses "two hundred and eighty pounds" and it mangles replies
 that legitimately mention the FAQ's prices. Making the model declare its intent
-moves the decision from pattern-matching to a contract. And when the model
-drifts off-schema, `parseAgentAction` falls back to treating the output as a
-plain reply, so the failure mode is ordinary conversation rather than a broken
-chat.
+moves the decision from pattern-matching to a contract.
+
+Service requests are sent with OpenAI's JSON mode on, so the response is
+guaranteed to parse rather than merely asked to. `parseAgentAction` keeps its
+lenient path — stripping markdown fences, falling back to treating the output as
+a plain reply — as a backstop for a model that returns valid JSON in the wrong
+shape. The failure mode is ordinary conversation, not a broken chat.
 
 ---
 
@@ -258,7 +274,7 @@ flowchart TB
         API -->|"look up by bizId"| DATA
     end
 
-    GEM["Google Gemini API<br/>3.8-flash → flash-latest → 2.5-flash"]
+    GEM["OpenAI API<br/>gpt-4.1-mini → gpt-4.1-nano"]
 
     CW -->|"POST {history, message, mode, bizId}"| API
     API -->|"text/event-stream"| CW
@@ -294,7 +310,7 @@ flowchart TD
     K -->|Yes| L["Emit: Applying pricing rules<br/>estimate only, owner approves"]
     K -->|No| M["Emit: Composing response"]
     L --> M
-    M --> N["Call Gemini with<br/>system prompt + history"]
+    M --> N["Call OpenAI with<br/>system prompt + recent turns"]
     N --> O{"Call succeeded?"}
     O -->|"503 / transient"| P["Retry, then next model<br/>in the fallback chain"]
     P --> O
@@ -333,7 +349,7 @@ amber box until a human has acted on it.**
 flowchart LR
     CUST(["Customer"])
     OWNER(["Business owner"])
-    GEMINI(["Gemini API"])
+    LLM(["OpenAI API"])
 
     subgraph sys["Rivon Agent"]
         U1["Choose product or service mode"]
@@ -372,11 +388,11 @@ flowchart LR
     O3 --> U8
     O5 --> U8
 
-    U3 --> GEMINI
-    U4 --> GEMINI
-    U5 --> GEMINI
-    U6 --> GEMINI
-    U7 --> GEMINI
+    U3 --> LLM
+    U4 --> LLM
+    U5 --> LLM
+    U6 --> LLM
+    U7 --> LLM
 ```
 
 Note that the customer's "receive an approved price" case is reachable **only**
@@ -391,7 +407,7 @@ sequenceDiagram
     participant UI as ChatWindow
     participant API as /api/chat
     participant D as lib/data.ts
-    participant G as Gemini
+    participant G as OpenAI
 
     C->>UI: types "What earbuds do you have?"
     UI->>UI: render user bubble + placeholder
@@ -421,7 +437,7 @@ sequenceDiagram
     participant C as Customer
     participant UI as ChatWindow
     participant API as /api/chat
-    participant G as Gemini
+    participant G as OpenAI
     participant IB as OwnerInbox
     participant O as Owner
 
@@ -453,6 +469,11 @@ sequenceDiagram
 Both of these cost real time, and both were invisible from the browser. The
 symptom in each case was identical: agent steps appeared and completed, then
 nothing — no reply, no error.
+
+These happened while the project ran on Gemini, before the switch to OpenAI
+(§3), so the model names below are historical. They are kept because the second
+one in particular will recur with any provider — nothing about it was specific
+to Google.
 
 ### 6.1 The model had been retired
 
@@ -503,13 +524,17 @@ that identified the problem.
 2. The code strips it anyway, so no future shell can reintroduce the fault:
 
 ```ts
-const API_KEY = (process.env.GEMINI_API_KEY ?? "").replace(/^﻿/, "").trim();
+const API_KEY = (process.env.OPENAI_API_KEY ?? "").replace(/^﻿/, "").trim();
 ```
 
 **Lesson:** when local works and production does not, with identical code, the
 difference is in the environment — and environment values can be malformed in
 ways no editor will show you. Always log the real error server-side, even when
 showing the customer something softer.
+
+This is not a Gemini problem. Every provider SDK puts the key in a header, so
+the same `echo` would break the OpenAI key identically. That is why the strip
+stayed in the code through the provider switch.
 
 ### 6.3 A smaller one: two fields with the same name
 
@@ -568,8 +593,8 @@ git clone https://github.com/syedd176/rivon-agent
 cd rivon-agent
 npm install
 
-# Gemini key from Google AI Studio
-echo "GEMINI_API_KEY=your_key_here" > .env.local
+# OpenAI key from platform.openai.com
+echo "OPENAI_API_KEY=your_key_here" > .env.local
 
 npm run dev     # http://localhost:3000
 npm run build   # production build, includes type check
@@ -581,7 +606,7 @@ Deploying:
 npx vercel --prod
 
 # add the key — note printf, NOT PowerShell echo, per §6.2
-printf 'your_key_here' | npx vercel env add GEMINI_API_KEY production
+printf 'your_key_here' | npx vercel env add OPENAI_API_KEY production
 ```
 
 ---
