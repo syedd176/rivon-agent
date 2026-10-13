@@ -52,10 +52,14 @@ type Props = {
   bizId: string;
   onQuote?: (q: { serviceName: string; answers: Record<string, string>; lines: { label: string; amount: number }[]; total: number; notes?: string }) => void;
   onEscalation?: (e: { question: string; reason: string }) => void;
+  /** Fires after each turn so the owner sidebar can refresh. */
+  onTurnComplete?: () => void;
+  /** Conversation restored from storage; replaces the welcome message. */
+  restored?: { role: "user" | "assistant"; content: string; ownerApproved?: boolean }[];
 };
 
 export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
-  { mode, bizId, onQuote, onEscalation },
+  { mode, bizId, onQuote, onEscalation, onTurnComplete, restored },
   ref
 ) {
   const [messages, setMessages] = useState<Message[]>([
@@ -65,6 +69,17 @@ export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Replay a stored conversation once it arrives.
+  useEffect(() => {
+    if (!restored || restored.length === 0) return;
+    setMessages(restored.map((m, i) => ({
+      id: `restored-${i}`,
+      role: m.role,
+      content: m.content,
+      ownerApproved: m.ownerApproved,
+    })));
+  }, [restored]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -97,16 +112,13 @@ export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
     setInput("");
     setLoading(true);
 
-    const historyForApi = messages
-      .filter(m => m.id !== "welcome")
-      .map(m => ({ role: m.role, content: m.content }));
-
     try {
       abortRef.current = new AbortController();
+      // History is read server-side from the session, so it is not sent here.
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ history: historyForApi, message: text, mode, bizId }),
+        body: JSON.stringify({ message: text, mode, bizId }),
         signal: abortRef.current.signal,
       });
 
@@ -183,8 +195,9 @@ export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
       }
     } finally {
       setLoading(false);
+      onTurnComplete?.();
     }
-  }, [loading, messages, mode, bizId, onQuote, onEscalation]);
+  }, [loading, mode, bizId, onQuote, onEscalation, onTurnComplete]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();

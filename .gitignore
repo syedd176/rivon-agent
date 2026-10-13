@@ -41,3 +41,9 @@ yarn-error.log*
 next-env.d.ts
 
 .vercel
+.env*
+
+# Vendor agent skills installed by the Neon integration
+.agents/
+.claude/
+skills-lock.json

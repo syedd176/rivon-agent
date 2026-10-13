@@ -1,66 +1,122 @@
 "use client";
 
 import { useState } from "react";
-import { Check, X, Pencil, Send, Inbox, AlertTriangle, ReceiptText } from "lucide-react";
+import { Check, X, Pencil, Send, Inbox, AlertTriangle, ReceiptText, Users } from "lucide-react";
 import { InboxItem, Quote, Escalation, isQuote, formatGBP } from "@/lib/quotes";
+import { Lead } from "@/lib/leads";
+import { LeadPanel } from "./LeadPanel";
+
+type Tab = "inbox" | "leads";
 
 export function OwnerInbox({
   items,
+  leads,
+  mySessionId,
+  mode,
   onApproveQuote,
   onRejectQuote,
   onAnswerEscalation,
 }: {
   items: InboxItem[];
+  leads: Lead[];
+  mySessionId: string | null;
+  mode: "product" | "service";
   onApproveQuote: (id: string, finalTotal: number) => void;
   onRejectQuote: (id: string) => void;
   onAnswerEscalation: (id: string, reply: string) => void;
 }) {
+  // Product mode has nothing to approve, so leads are the only thing to show.
+  const [tab, setTab] = useState<Tab>(mode === "service" ? "inbox" : "leads");
+
   const pendingCount = items.filter(i =>
     isQuote(i) ? i.status === "pending" : i.status === "unanswered"
   ).length;
+
+  const ranked = [...leads].sort((a, b) => b.score - a.score);
 
   return (
     <aside
       className="flex flex-col h-full"
       style={{ background: "var(--surface)", borderLeft: "1px solid var(--border)" }}
     >
-      <header
-        className="flex items-center justify-between px-4 py-3 flex-shrink-0"
-        style={{ borderBottom: "1px solid var(--border)" }}
-      >
-        <div className="flex items-center gap-2">
-          <Inbox size={14} style={{ color: "var(--amber)" }} />
-          <span className="text-sm font-semibold" style={{ color: "var(--text)" }}>Owner Inbox</span>
+      <header className="flex-shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
+        <div className="flex items-center justify-between px-4 pt-3 pb-2">
+          <span className="text-sm font-semibold" style={{ color: "var(--text)" }}>Owner view</span>
+          {pendingCount > 0 && mode === "service" && (
+            <span
+              className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
+              style={{ background: "var(--amber-dim)", color: "var(--amber)" }}
+            >
+              {pendingCount} waiting
+            </span>
+          )}
         </div>
-        {pendingCount > 0 && (
-          <span
-            className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
-            style={{ background: "var(--amber-dim)", color: "var(--amber)" }}
-          >
-            {pendingCount} waiting
-          </span>
-        )}
+
+        <div className="flex gap-1 px-3 pb-2">
+          {mode === "service" && (
+            <TabButton active={tab === "inbox"} onClick={() => setTab("inbox")} icon={<Inbox size={11} />} label="Inbox" count={pendingCount} />
+          )}
+          <TabButton active={tab === "leads"} onClick={() => setTab("leads")} icon={<Users size={11} />} label="Leads" count={leads.length} />
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-3">
-        {items.length === 0 ? (
-          <EmptyState />
-        ) : (
-          items.map(item =>
-            isQuote(item) ? (
-              <QuoteCard
-                key={item.id}
-                quote={item}
-                onApprove={onApproveQuote}
-                onReject={onRejectQuote}
-              />
-            ) : (
-              <EscalationCard key={item.id} escalation={item} onAnswer={onAnswerEscalation} />
+        {tab === "inbox" ? (
+          items.length === 0 ? (
+            <EmptyState />
+          ) : (
+            items.map(item =>
+              isQuote(item) ? (
+                <QuoteCard key={item.id} quote={item} onApprove={onApproveQuote} onReject={onRejectQuote} />
+              ) : (
+                <EscalationCard key={item.id} escalation={item} onAnswer={onAnswerEscalation} />
+              )
             )
           )
+        ) : ranked.length === 0 ? (
+          <EmptyLeads />
+        ) : (
+          ranked.map(lead => (
+            <LeadPanel key={lead.sessionId} lead={lead} isYou={lead.sessionId === mySessionId} />
+          ))
         )}
       </div>
     </aside>
+  );
+}
+
+function TabButton({
+  active, onClick, icon, label, count,
+}: {
+  active: boolean; onClick: () => void; icon: React.ReactNode; label: string; count: number;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors"
+      style={{
+        background: active ? "var(--surface-2)" : "transparent",
+        color: active ? "var(--text)" : "var(--text-muted)",
+        border: `1px solid ${active ? "var(--border)" : "transparent"}`,
+      }}
+    >
+      {icon}
+      {label}
+      {count > 0 && <span style={{ opacity: 0.6 }}>{count}</span>}
+    </button>
+  );
+}
+
+function EmptyLeads() {
+  return (
+    <div className="flex flex-col items-center justify-center text-center px-4 py-10 gap-2">
+      <Users size={22} style={{ color: "var(--text-muted)", opacity: 0.4 }} />
+      <p className="text-xs font-medium" style={{ color: "var(--text-muted)" }}>No visitors yet</p>
+      <p className="text-[11px] leading-relaxed" style={{ color: "var(--text-muted)", opacity: 0.7 }}>
+        Every customer who chats appears here, scored on how close they are to
+        buying, with what they asked about.
+      </p>
+    </div>
   );
 }
 

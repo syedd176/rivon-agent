@@ -2,6 +2,10 @@ import { NextRequest } from "next/server";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { businesses, serviceBusinesses, ServiceOffering } from "@/lib/data";
+import { getSessionId } from "@/lib/session";
+import { getStore, SessionRecord, StoredMessage } from "@/lib/store";
+import { Lead, LeadStage, emptyLead, STAGE_ORDER } from "@/lib/leads";
+import { Quote, Escalation } from "@/lib/quotes";
 
 export const maxDuration = 60;
 
@@ -83,10 +87,46 @@ function findServiceMatches(query: string, bizId: string) {
     .slice(0, 3);
 }
 
-type AgentAction =
+type LeadRead = {
+  score?: number;
+  stage?: LeadStage;
+  interest?: string;
+  mentionedItems?: string[];
+  facts?: Record<string, string>;
+  signals?: { label: string; positive: boolean }[];
+};
+
+type AgentAction = (
   | { action: "reply"; reply: string }
   | { action: "quote"; reply: string; serviceName: string; answers: Record<string, string>; lines: { label: string; amount: number }[]; notes?: string }
-  | { action: "escalate"; reply: string; question: string; reason: string };
+  | { action: "escalate"; reply: string; question: string; reason: string }
+) & { lead?: LeadRead };
+
+/** Scoring rubric shared by both modes — the model returns this alongside its reply. */
+const LEAD_BLOCK = `
+ALSO include a "lead" object scoring this customer, judged on the whole
+conversation so far, not just the last message:
+
+"lead": {
+  "score": <0-100>,
+  "stage": "browsing" | "comparing" | "intent" | "qualified" | "ready",
+  "interest": "<what they want, one short phrase in their own terms>",
+  "mentionedItems": ["<names of items or services they engaged with>"],
+  "facts": {"<label>":"<value>"},
+  "signals": [{"label":"<short observation>","positive":true|false}]
+}
+
+Scoring guide:
+- 0-25  browsing — vague questions, no specifics
+- 26-45 comparing — weighing options, asking about differences
+- 46-65 intent — named a specific item or service, asking practical questions
+- 66-85 qualified — gave details that let you serve them (size, postcode, date, quantity)
+- 86-100 ready — asking to buy, book, or confirm
+
+Put concrete details in "facts": postcode, budget, timing, property size,
+quantity, sizes. Keep labels short ("Postcode", "Needed by", "Property").
+Signals are brief and honest — "asked about next-day delivery" (positive),
+"only price-checking" (negative). Never invent facts the customer did not give.`;
 
 /**
  * The model returns JSON so the server decides what happens next, rather than
@@ -106,7 +146,8 @@ function parseAgentAction(raw: string): AgentAction {
       if (parsed.action === "escalate" && typeof parsed.question === "string") {
         return parsed as AgentAction;
       }
-      return { action: "reply", reply: parsed.reply };
+      // Keep `lead` — it rides alongside every action, including a plain reply.
+      return { action: "reply", reply: parsed.reply, lead: parsed.lead };
     }
   } catch {
     // Model returned prose instead of JSON — use it as the reply.
@@ -114,8 +155,42 @@ function parseAgentAction(raw: string): AgentAction {
   return { action: "reply", reply: candidate };
 }
 
+/** Merge the model's read of the lead onto the stored one, keeping facts it stops repeating. */
+function mergeLead(prev: Lead, read: LeadRead | undefined, messageCount: number): Lead {
+  if (!read) return { ...prev, messageCount, lastSeen: Date.now() };
+  const stage = read.stage && STAGE_ORDER.includes(read.stage) ? read.stage : prev.stage;
+  return {
+    ...prev,
+    score: typeof read.score === "number" ? Math.max(0, Math.min(100, Math.round(read.score))) : prev.score,
+    stage,
+    interest: read.interest?.trim() || prev.interest,
+    mentionedItems: [...new Set([...prev.mentionedItems, ...(read.mentionedItems ?? [])])].slice(0, 8),
+    facts: { ...prev.facts, ...(read.facts ?? {}) },
+    signals: (read.signals ?? prev.signals).slice(0, 6),
+    messageCount,
+    lastSeen: Date.now(),
+  };
+}
+
 export async function POST(req: NextRequest) {
-  const { history, message, mode, bizId } = await req.json();
+  const { message, mode, bizId } = await req.json();
+
+  const sessionId = await getSessionId();
+  const store = getStore();
+  const existing = await store.getSession(sessionId, bizId);
+  const session: SessionRecord = existing ?? {
+    sessionId,
+    bizId,
+    mode,
+    messages: [],
+    lead: emptyLead(sessionId, bizId, mode),
+    inbox: [],
+    updatedAt: Date.now(),
+  };
+
+  // History comes from storage, not the client, so a tampered payload cannot
+  // inject turns into another customer's conversation.
+  const history = session.messages.map(m => ({ role: m.role, content: m.content }));
 
   let systemPrompt = "";
 
@@ -134,7 +209,11 @@ Your job:
 - ONLY quote prices from the catalogue. Never invent prices.
 - If a product is out of stock, say so clearly.
 - Keep replies under 130 words. Be friendly and helpful.
-- End with a follow-up question or offer where appropriate.`;
+- End with a follow-up question or offer where appropriate.
+
+You reply with a single JSON object:
+{"action":"reply","reply":"<your message to the customer>"}
+${LEAD_BLOCK}`;
   } else {
     const biz = serviceBusinesses.find(b => b.id === bizId);
     if (!biz) return new Response("Business not found", { status: 404 });
@@ -179,7 +258,8 @@ RULES THAT OVERRIDE EVERYTHING:
 - Ask the qualification questions before quoting. Two or three at a time, not
   all at once. Do not quote on guesses.
 - "lines" must come from the rate card. Do not invent charges.
-- Keep every "reply" under 130 words. Warm, but efficient.`;
+- Keep every "reply" under 130 words. Warm, but efficient.
+${LEAD_BLOCK}`;
   }
 
   const encoder = new TextEncoder();
@@ -238,12 +318,8 @@ RULES THAT OVERRIDE EVERYTHING:
           { role: "user", content: message },
         ];
 
-        const raw = await generateWithFallback(messages, mode === "service");
-
-        // Product mode is plain prose; only service mode uses the action schema.
-        const result: AgentAction = mode === "service"
-          ? parseAgentAction(raw)
-          : { action: "reply", reply: raw };
+        const raw = await generateWithFallback(messages, true);
+        const result: AgentAction = parseAgentAction(raw);
 
         send({ type: "step", stepType: "responding", id: "5", label: "Response ready", status: "done" });
 
@@ -251,22 +327,33 @@ RULES THAT OVERRIDE EVERYTHING:
           const total = result.lines.reduce((sum, l) => sum + (Number(l.amount) || 0), 0);
           send({ type: "step", stepType: "pricing", id: "6", label: "Quote built from rate card", detail: `${result.lines.length} line${result.lines.length !== 1 ? "s" : ""}`, status: "done" });
           send({ type: "step", stepType: "escalating", id: "7", label: "Sent to owner for approval", detail: "Held — not shown to customer", status: "done" });
-          send({
-            type: "quote",
-            quote: {
-              serviceName: result.serviceName,
-              answers: result.answers ?? {},
-              lines: result.lines,
-              total,
-              notes: result.notes,
-            },
-          });
+          const quote: Quote = {
+            id: `q-${Date.now()}`,
+            kind: "quote",
+            bizId,
+            serviceName: result.serviceName,
+            answers: result.answers ?? {},
+            lines: result.lines,
+            total,
+            notes: result.notes,
+            status: "pending",
+            createdAt: Date.now(),
+          };
+          session.inbox = [quote, ...session.inbox];
+          send({ type: "quote", quote });
         } else if (result.action === "escalate") {
           send({ type: "step", stepType: "escalating", id: "6", label: "Escalated to owner", detail: result.reason, status: "done" });
-          send({
-            type: "escalation",
-            escalation: { question: result.question, reason: result.reason },
-          });
+          const escalation: Escalation = {
+            id: `e-${Date.now()}`,
+            kind: "escalation",
+            bizId,
+            question: result.question,
+            reason: result.reason,
+            status: "unanswered",
+            createdAt: Date.now(),
+          };
+          session.inbox = [escalation, ...session.inbox];
+          send({ type: "escalation", escalation });
         }
 
         // Service prices reach the customer only through owner approval, so the
@@ -282,6 +369,18 @@ RULES THAT OVERRIDE EVERYTHING:
 
         send({ type: "matched", items: safeMatches });
         send({ type: "content", text: result.reply });
+
+        const now = Date.now();
+        const turns: StoredMessage[] = [
+          { role: "user", content: message, ts: now },
+          { role: "assistant", content: result.reply, ts: now + 1 },
+        ];
+        session.messages = [...session.messages, ...turns];
+        session.lead = mergeLead(session.lead, result.lead, session.messages.length);
+        session.updatedAt = now;
+        await store.saveSession(session);
+
+        send({ type: "lead", lead: session.lead });
         send({ type: "done" });
       } catch (err) {
         const raw = String(err);

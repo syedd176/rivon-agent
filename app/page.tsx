@@ -1,99 +1,96 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
-import { Zap, ChevronRight, ChevronLeft, ShoppingBag, Wrench, Inbox } from "lucide-react";
+import { useState, useRef, useCallback, useEffect } from "react";
+import { Zap, ChevronRight, ChevronLeft, ShoppingBag, Wrench, PanelRight } from "lucide-react";
 import { ChatWindow, ChatHandle } from "@/components/ChatWindow";
 import { OwnerInbox } from "@/components/OwnerInbox";
 import { businesses, serviceBusinesses } from "@/lib/data";
-import { InboxItem, Quote, Escalation, isQuote, formatGBP } from "@/lib/quotes";
+import { InboxItem, isQuote } from "@/lib/quotes";
+import { Lead } from "@/lib/leads";
 
 type Mode = "product" | "service";
+
+type RestoredMessage = { role: "user" | "assistant"; content: string; ownerApproved?: boolean };
 
 export default function Home() {
   const [mode, setMode] = useState<Mode | null>(null);
   const [bizId, setBizId] = useState<string | null>(null);
   const [items, setItems] = useState<InboxItem[]>([]);
+  const [leads, setLeads] = useState<Lead[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [restored, setRestored] = useState<RestoredMessage[] | undefined>();
   const [mobilePane, setMobilePane] = useState<"chat" | "inbox">("chat");
   const chatRef = useRef<ChatHandle>(null);
+
+  /** Pulls this browser's conversation plus every lead for the business. */
+  const refresh = useCallback(async (id: string, m: Mode, withMessages = false) => {
+    try {
+      const res = await fetch(`/api/session?bizId=${id}&mode=${m}`, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      setSessionId(data.sessionId);
+      setLeads(data.leads ?? []);
+      setItems(data.allInbox ?? []);
+      if (withMessages && data.messages?.length) setRestored(data.messages);
+    } catch {
+      // Offline or the route is unreachable — the chat still works without it.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (bizId && mode) refresh(bizId, mode, true);
+  }, [bizId, mode, refresh]);
 
   const reset = () => {
     setBizId(null);
     setItems([]);
+    setLeads([]);
+    setRestored(undefined);
     setMobilePane("chat");
   };
 
-  const handleQuote = useCallback((q: {
-    serviceName: string;
-    answers: Record<string, string>;
-    lines: { label: string; amount: number }[];
-    total: number;
-    notes?: string;
-  }) => {
-    if (!bizId) return;
-    const quote: Quote = {
-      id: `q-${Date.now()}`,
-      kind: "quote",
-      bizId,
-      serviceName: q.serviceName,
-      answers: q.answers,
-      lines: q.lines,
-      total: q.total,
-      notes: q.notes,
-      status: "pending",
-      createdAt: Date.now(),
-    };
-    setItems(prev => [quote, ...prev]);
-  }, [bizId]);
+  const onTurnComplete = useCallback(() => {
+    if (bizId && mode) refresh(bizId, mode);
+  }, [bizId, mode, refresh]);
 
-  const handleEscalation = useCallback((e: { question: string; reason: string }) => {
-    if (!bizId) return;
-    const esc: Escalation = {
-      id: `e-${Date.now()}`,
-      kind: "escalation",
-      bizId,
-      question: e.question,
-      reason: e.reason,
-      status: "unanswered",
-      createdAt: Date.now(),
-    };
-    setItems(prev => [esc, ...prev]);
-  }, [bizId]);
+  /** Owner actions go through the API so the change persists for everyone. */
+  const ownerAct = useCallback(async (
+    item: InboxItem,
+    action: "approve" | "reject" | "answer",
+    extra?: { finalTotal?: number; reply?: string }
+  ) => {
+    const targetSessionId = (item as InboxItem & { sessionId?: string }).sessionId;
+    if (!bizId || !targetSessionId) return;
+
+    const res = await fetch("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bizId, targetSessionId, itemId: item.id, action, ...extra }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+
+    // Only this browser's own chat updates live; other visitors see it on reload.
+    if (data.customerMessage && targetSessionId === sessionId) {
+      chatRef.current?.pushOwnerMessage(data.customerMessage);
+    }
+    if (mode) refresh(bizId, mode);
+  }, [bizId, mode, sessionId, refresh]);
 
   const approveQuote = useCallback((id: string, finalTotal: number) => {
-    setItems(prev => prev.map(item => {
-      if (item.id !== id || !isQuote(item)) return item;
-      const changed = finalTotal !== item.total;
-      const approved: Quote = {
-        ...item,
-        originalTotal: changed ? item.total : item.originalTotal,
-        total: finalTotal,
-        status: "approved",
-        resolvedAt: Date.now(),
-      };
-      chatRef.current?.pushOwnerMessage(
-        `Thanks for waiting. For ${approved.serviceName.toLowerCase()}, that comes to ${formatGBP(finalTotal)}. Would you like to go ahead and book it in?`
-      );
-      return approved;
-    }));
-  }, []);
+    const item = items.find(i => i.id === id);
+    if (item) ownerAct(item, "approve", { finalTotal });
+  }, [items, ownerAct]);
 
   const rejectQuote = useCallback((id: string) => {
-    setItems(prev => prev.map(item => {
-      if (item.id !== id || !isQuote(item)) return item;
-      chatRef.current?.pushOwnerMessage(
-        "Thanks for your patience. We need to look at this one more closely before quoting — someone from the team will come back to you shortly."
-      );
-      return { ...item, status: "rejected" as const, resolvedAt: Date.now() };
-    }));
-  }, []);
+    const item = items.find(i => i.id === id);
+    if (item) ownerAct(item, "reject");
+  }, [items, ownerAct]);
 
   const answerEscalation = useCallback((id: string, reply: string) => {
-    setItems(prev => prev.map(item => {
-      if (item.id !== id || isQuote(item)) return item;
-      chatRef.current?.pushOwnerMessage(reply);
-      return { ...item, ownerReply: reply, status: "answered" as const, resolvedAt: Date.now() };
-    }));
-  }, []);
+    const item = items.find(i => i.id === id);
+    if (item) ownerAct(item, "answer", { reply });
+  }, [items, ownerAct]);
 
   if (!mode) return <LandingScreen onSelect={setMode} />;
   if (!bizId) return <BizSelect mode={mode} onBack={() => setMode(null)} onSelect={setBizId} />;
@@ -106,7 +103,8 @@ export default function Home() {
     isQuote(i) ? i.status === "pending" : i.status === "unanswered"
   ).length;
 
-  const showInbox = mode === "service";
+  // Product mode has no approvals, but still has leads worth watching.
+  const showInbox = true;
 
   return (
     <div className="flex flex-col h-full" style={{ background: "var(--background)" }}>
@@ -142,7 +140,7 @@ export default function Home() {
               className="md:hidden flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px]"
               style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-muted)" }}
             >
-              <Inbox size={11} />
+              <PanelRight size={11} />
               {mobilePane === "chat" ? "Owner" : "Chat"}
               {pendingCount > 0 && mobilePane === "chat" && (
                 <span
@@ -170,8 +168,8 @@ export default function Home() {
             ref={chatRef}
             mode={mode}
             bizId={bizId}
-            onQuote={handleQuote}
-            onEscalation={handleEscalation}
+            restored={restored}
+            onTurnComplete={onTurnComplete}
           />
         </div>
 
@@ -182,6 +180,9 @@ export default function Home() {
             <div className="w-full">
               <OwnerInbox
                 items={items}
+                leads={leads}
+                mySessionId={sessionId}
+                mode={mode}
                 onApproveQuote={approveQuote}
                 onRejectQuote={rejectQuote}
                 onAnswerEscalation={answerEscalation}

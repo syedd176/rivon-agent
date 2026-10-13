@@ -2,6 +2,7 @@
 
 import { Package, Clock, CheckCircle2, XCircle, Tag, Lock } from "lucide-react";
 import { Product, ServiceOffering } from "@/lib/data";
+import { productImage } from "@/lib/productImage";
 
 /** Service matches arrive without basePrice — prices need owner approval first. */
 type ServiceWithheldPrice = Omit<ServiceOffering, "basePrice"> & { basePrice?: number };
@@ -19,22 +20,36 @@ export function ItemCard({ item }: { item: Product | ServiceWithheldPrice }) {
       className="rounded-lg p-3 flex flex-col gap-1.5"
       style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}
     >
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex items-center gap-1.5 font-medium text-xs" style={{ color: "var(--text)" }}>
-          <Package size={11} style={{ color: "var(--accent)" }} />
-          <span>{item.name}</span>
+      <div className="flex items-start gap-2.5">
+        {prod && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={productImage(item.category, item.name)}
+            alt=""
+            width={48}
+            height={48}
+            className="rounded-md flex-shrink-0"
+            style={{ background: "var(--background)" }}
+          />
+        )}
+        <div className="flex-1 min-w-0 flex flex-col gap-1">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-1.5 font-medium text-xs" style={{ color: "var(--text)" }}>
+              <Package size={11} style={{ color: "var(--accent)" }} />
+              <span>{item.name}</span>
+            </div>
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded-full flex-shrink-0"
+              style={{ background: "var(--accent-dim)", color: "var(--accent)" }}
+            >
+              {item.category}
+            </span>
+          </div>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.7rem", lineHeight: 1.4 }}>
+            {item.description.slice(0, 100)}{item.description.length > 100 ? "…" : ""}
+          </p>
         </div>
-        <span
-          className="text-[10px] px-1.5 py-0.5 rounded-full flex-shrink-0"
-          style={{ background: "var(--accent-dim)", color: "var(--accent)" }}
-        >
-          {item.category}
-        </span>
       </div>
-
-      <p style={{ color: "var(--text-muted)", fontSize: "0.7rem", lineHeight: 1.4 }}>
-        {item.description.slice(0, 100)}{item.description.length > 100 ? "…" : ""}
-      </p>
 
       {prod && (item as Product).colors && (
         <p style={{ color: "var(--text-muted)", fontSize: "0.68rem" }}>
