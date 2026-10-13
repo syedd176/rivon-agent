@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0c0c0f;
+  --surface: #141418;
+  --surface-2: #1a1a20;
+  --border: #2a2a35;
+  --text: #e8e8f0;
+  --text-muted: #8888a0;
+  --accent: #6c63ff;
+  --accent-dim: #6c63ff22;
+  --green: #22c55e;
+  --green-dim: #22c55e22;
+  --amber: #f59e0b;
+  --amber-dim: #f59e0b22;
+  --red: #ef4444;
+}
+
+body {
+  background: var(--background);
+  color: var(--text);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+@keyframes slide-in {
+  from { transform: translateY(8px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes thinking {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+}
+
+.msg-in { animation: slide-in 0.2s ease; }
+.thinking-dot { animation: thinking 1.2s ease-in-out infinite; }
+.thinking-dot:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dot:nth-child(3) { animation-delay: 0.4s; }
