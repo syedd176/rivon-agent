@@ -2,7 +2,13 @@ import { NextRequest } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { businesses, serviceBusinesses } from "@/lib/data";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+export const maxDuration = 60;
+
+// Strip BOM and whitespace: a key pasted through a shell can carry U+FEFF,
+// which throws when the SDK puts it in an HTTP header.
+const API_KEY = (process.env.GEMINI_API_KEY ?? "").replace(/^﻿/, "").trim();
+
+const genAI = new GoogleGenerativeAI(API_KEY);
 
 function delay(ms: number) {
   return new Promise(r => setTimeout(r, ms));
@@ -109,6 +115,9 @@ Your job:
       };
 
       try {
+        if (!API_KEY) {
+          throw new Error("GEMINI_API_KEY is not configured on the server");
+        }
         send({ type: "step", stepType: "thinking", id: "1", label: "Understanding intent", status: "running" });
         await delay(250);
         send({ type: "step", stepType: "thinking", id: "1", label: "Understanding intent", status: "done" });
@@ -157,6 +166,7 @@ Your job:
         send({ type: "done" });
       } catch (err) {
         const raw = String(err);
+        console.error("[chat] generation failed:", raw);
         const friendly = raw.includes("503") || raw.includes("high demand")
           ? "The AI service is busy right now. Please send your message again in a moment."
           : "Sorry, something went wrong generating a reply. Please try again.";
