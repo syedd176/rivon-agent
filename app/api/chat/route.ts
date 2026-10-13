@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { businesses, serviceBusinesses } from "@/lib/data";
+import { businesses, serviceBusinesses, ServiceOffering } from "@/lib/data";
 
 export const maxDuration = 60;
 
@@ -250,7 +250,18 @@ RULES THAT OVERRIDE EVERYTHING:
           });
         }
 
-        send({ type: "matched", items: matched });
+        // Service prices reach the customer only through owner approval, so the
+        // rate card goes to the model but never to the browser. Product prices
+        // were set by the business, so they ship as-is.
+        const safeMatches = mode === "service"
+          ? matched.map(m => {
+              const { basePrice, ...rest } = m as ServiceOffering;
+              void basePrice;
+              return rest;
+            })
+          : matched;
+
+        send({ type: "matched", items: safeMatches });
         send({ type: "content", text: result.reply });
         send({ type: "done" });
       } catch (err) {

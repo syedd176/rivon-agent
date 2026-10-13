@@ -1,14 +1,18 @@
 "use client";
 
-import { Package, Clock, CheckCircle2, XCircle, Tag } from "lucide-react";
+import { Package, Clock, CheckCircle2, XCircle, Tag, Lock } from "lucide-react";
 import { Product, ServiceOffering } from "@/lib/data";
 
-function isProduct(item: Product | ServiceOffering): item is Product {
+/** Service matches arrive without basePrice — prices need owner approval first. */
+type ServiceWithheldPrice = Omit<ServiceOffering, "basePrice"> & { basePrice?: number };
+
+function isProduct(item: Product | ServiceWithheldPrice): item is Product {
   return "inStock" in item;
 }
 
-export function ItemCard({ item }: { item: Product | ServiceOffering }) {
+export function ItemCard({ item }: { item: Product | ServiceWithheldPrice }) {
   const prod = isProduct(item);
+  const priceWithheld = !prod && (item as ServiceWithheldPrice).basePrice === undefined;
 
   return (
     <div
@@ -45,15 +49,31 @@ export function ItemCard({ item }: { item: Product | ServiceOffering }) {
 
       <div className="flex items-center justify-between mt-0.5">
         <div className="flex items-center gap-2">
-          <span className="font-semibold text-sm" style={{ color: "var(--text)" }}>
-            £{prod ? (item as Product).price.toFixed(2) : (item as ServiceOffering).basePrice === 0 ? "Free" : (item as ServiceOffering).basePrice.toFixed(2)}
-          </span>
-          {prod && (item as Product).originalPrice && (
-            <span style={{ color: "var(--text-muted)", fontSize: "0.7rem", textDecoration: "line-through" }}>
-              £{(item as Product).originalPrice!.toFixed(2)}
+          {priceWithheld ? (
+            <span
+              className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded"
+              style={{ background: "var(--amber-dim)", color: "var(--amber)" }}
+            >
+              <Lock size={9} />
+              Priced after the team confirms
             </span>
+          ) : (
+            <>
+              <span className="font-semibold text-sm" style={{ color: "var(--text)" }}>
+                {prod
+                  ? "£" + (item as Product).price.toFixed(2)
+                  : (item as ServiceWithheldPrice).basePrice === 0
+                    ? "Free"
+                    : "£" + (item as ServiceWithheldPrice).basePrice!.toFixed(2)}
+              </span>
+              {prod && (item as Product).originalPrice && (
+                <span style={{ color: "var(--text-muted)", fontSize: "0.7rem", textDecoration: "line-through" }}>
+                  £{(item as Product).originalPrice!.toFixed(2)}
+                </span>
+              )}
+              <span style={{ color: "var(--text-muted)", fontSize: "0.68rem" }}>/{item.unit}</span>
+            </>
           )}
-          <span style={{ color: "var(--text-muted)", fontSize: "0.68rem" }}>/{item.unit}</span>
         </div>
 
         {prod ? (

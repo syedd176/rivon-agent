@@ -11,7 +11,8 @@ export type Message = {
   role: "user" | "assistant";
   content: string;
   steps?: Step[];
-  matchedItems?: (Product | ServiceOffering)[];
+  /** Service matches arrive with basePrice stripped — see the API route. */
+  matchedItems?: (Product | (Omit<ServiceOffering, "basePrice"> & { basePrice?: number }))[];
   /** Customer is waiting on the owner; shown as a hold chip under the bubble. */
   awaiting?: boolean;
   /** Reached the customer only after the owner approved it. */
