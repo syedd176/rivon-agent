@@ -1,39 +1,55 @@
 import { NextRequest } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { businesses, serviceBusinesses, ServiceOffering } from "@/lib/data";
 
 export const maxDuration = 60;
 
 // Strip BOM and whitespace: a key pasted through a shell can carry U+FEFF,
 // which throws when the SDK puts it in an HTTP header.
-const API_KEY = (process.env.GEMINI_API_KEY ?? "").replace(/^﻿/, "").trim();
+const API_KEY = (process.env.OPENAI_API_KEY ?? "").replace(/^﻿/, "").trim();
 
-const genAI = new GoogleGenerativeAI(API_KEY);
+const openai = new OpenAI({ apiKey: API_KEY, maxRetries: 2 });
 
 function delay(ms: number) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-const MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash"];
+// gpt-4.1-mini handles this well and costs a fraction of 4o; nano is the
+// cheaper fallback if the primary is rate-limited.
+const MODELS = ["gpt-4.1-mini", "gpt-4.1-nano"];
 
-type GeminiTurn = { role: string; parts: { text: string }[] };
+/**
+ * Only the trailing turns are sent. The system prompt carries the catalogue,
+ * and a service conversation is qualification questions — the last few
+ * exchanges hold everything the model needs.
+ */
+const HISTORY_TURNS = 8;
 
-// Gemini flash models return 503 under load; try each model, with one retry per model.
-async function generateWithFallback(history: GeminiTurn[], message: string): Promise<string> {
+async function generateWithFallback(
+  messages: ChatCompletionMessageParam[],
+  wantJson: boolean
+): Promise<string> {
   let lastErr: unknown;
-  for (const modelName of MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const model = genAI.getGenerativeModel({ model: modelName });
-        const session = model.startChat({ history });
-        const result = await session.sendMessage(message);
-        return result.response.text();
-      } catch (err) {
-        lastErr = err;
-        const msg = String(err);
-        if (msg.includes("404") || msg.includes("no longer available")) break;
-        if (attempt === 0) await delay(700);
-      }
+  for (const model of MODELS) {
+    try {
+      const completion = await openai.chat.completions.create({
+        model,
+        messages,
+        temperature: 0.4,
+        max_tokens: 500,
+        // Guarantees parseable output instead of hoping the model stays on schema.
+        ...(wantJson ? { response_format: { type: "json_object" as const } } : {}),
+      });
+      const text = completion.choices[0]?.message?.content?.trim();
+      if (text) return text;
+      throw new Error("Empty completion");
+    } catch (err) {
+      lastErr = err;
+      const status = (err as { status?: number }).status;
+      // 400/401/404 are our fault, not load — another model will fail the same way.
+      if (status === 400 || status === 401 || status === 404) throw err;
+      await delay(500);
     }
   }
   throw lastErr;
@@ -134,8 +150,7 @@ ${JSON.stringify(biz.faq, null, 2)}
 QUALIFICATION QUESTIONS you must have answers to before any quote:
 ${JSON.stringify(biz.qualificationQuestions, null, 2)}
 
-You reply ONLY with a JSON object. No prose outside it, no markdown fences.
-Choose exactly one of three actions.
+You reply with a single JSON object. Choose exactly one of three actions.
 
 1. Normal conversation — answering a question, or asking qualification questions:
 {"action":"reply","reply":"<your message>"}
@@ -176,7 +191,7 @@ RULES THAT OVERRIDE EVERYTHING:
 
       try {
         if (!API_KEY) {
-          throw new Error("GEMINI_API_KEY is not configured on the server");
+          throw new Error("OPENAI_API_KEY is not configured on the server");
         }
 
         send({ type: "step", stepType: "thinking", id: "1", label: "Understanding intent", status: "running" });
@@ -210,16 +225,20 @@ RULES THAT OVERRIDE EVERYTHING:
 
         send({ type: "step", stepType: "responding", id: "5", label: "Composing response", status: "running" });
 
-        const geminiHistory = [
-          { role: "user", parts: [{ text: systemPrompt }] },
-          { role: "model", parts: [{ text: mode === "service" ? '{"action":"reply","reply":"Understood. I will reply only in JSON."}' : "Understood. I'm ready to help customers." }] },
-          ...(history || []).map((m: { role: string; content: string }) => ({
-            role: m.role === "assistant" ? "model" : "user",
-            parts: [{ text: m.content }],
+        // System prompt first and unchanged across a conversation, so OpenAI's
+        // automatic prefix caching covers the catalogue on every turn after the
+        // first. Only recent turns follow it.
+        const recent = (history || []).slice(-HISTORY_TURNS);
+        const messages: ChatCompletionMessageParam[] = [
+          { role: "system", content: systemPrompt },
+          ...recent.map((m: { role: string; content: string }) => ({
+            role: m.role === "assistant" ? ("assistant" as const) : ("user" as const),
+            content: m.content,
           })),
+          { role: "user", content: message },
         ];
 
-        const raw = await generateWithFallback(geminiHistory, message);
+        const raw = await generateWithFallback(messages, mode === "service");
 
         // Product mode is plain prose; only service mode uses the action schema.
         const result: AgentAction = mode === "service"
@@ -266,9 +285,11 @@ RULES THAT OVERRIDE EVERYTHING:
         send({ type: "done" });
       } catch (err) {
         const raw = String(err);
-        console.error("[chat] generation failed:", raw);
-        const friendly = raw.includes("503") || raw.includes("high demand")
-          ? "The AI service is busy right now. Please send your message again in a moment."
+        const status = (err as { status?: number }).status;
+        console.error("[chat] generation failed:", status ?? "", raw);
+        const friendly =
+          status === 429 ? "The assistant is handling a lot of requests right now. Please send that again in a moment."
+          : status === 401 ? "The assistant is not configured correctly. Please let the team know."
           : "Sorry, something went wrong generating a reply. Please try again.";
         send({ type: "step", stepType: "responding", id: "5", label: "Response failed", status: "error" });
         send({ type: "error", message: friendly });
