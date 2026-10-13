@@ -79,14 +79,17 @@ yet — postcode, property size, what pest, how long. So each provider carries
 > The model never produces a number that commits the business.
 
 In product mode, prices come from the catalogue and the agent is told never to
-invent one. In service mode, the agent gives **estimate ranges only** and states
-that the owner approves the final price.
+invent one. Those prices were set by the business, so there is nothing to
+approve.
+
+In service mode the rule is **structural, not advisory**. The agent cannot send
+a price at all. It builds the quote, the quote goes to the owner, and the figure
+reaches the customer only after a human approves it. §4.5 describes the
+mechanism.
 
 This is not stylistic caution. A quoted price can bind the business: *Moffatt v
 Air Canada* (2024) rejected the defence that a chatbot is a separate agent from
-the company operating it. The constraint is inherited from the main project's
-design and is enforced in the system prompt on every single request, not just
-the first turn of a conversation.
+the company operating it.
 
 ---
 
@@ -177,6 +180,57 @@ If everything fails, the customer sees plain language — "the AI service is bus
 send that again" — while the real error goes to `console.error` and lands in
 Vercel's runtime logs. §6 shows why that logging mattered.
 
+### 4.5 Owner approval — how a price actually reaches a customer
+
+This is the part that makes the pricing rule real rather than a line in a
+prompt.
+
+**The agent returns JSON, not prose.** In service mode the model must answer
+with one of three actions, and the server decides what happens from there:
+
+| Action | When | What happens |
+|---|---|---|
+| `reply` | Normal conversation, including asking qualification questions | Message goes straight to the customer |
+| `quote` | Qualification is complete and the customer wants a price | Quote is built from the rate card and **held for the owner** |
+| `escalate` | The question needs a human — an exception, a bespoke job, something not in the rate card or FAQ | Question goes to the owner |
+
+The important consequence: **the customer-facing `reply` field and the price are
+different fields.** A quote carries `lines` and a `total`, and those are sent to
+the owner inbox — never into the chat. The prompt forbids stating a number in
+`reply`, and because the number travels separately, the agent has no path to
+leak one even if it tried.
+
+**What the customer sees while waiting:**
+
+> Thank you for those details. Your request is with our team and a price will be
+> sent to you shortly.
+
+with an "Awaiting confirmation from the team" chip underneath.
+
+**What the owner sees**, in the sidebar, at the same moment:
+
+- the service the agent matched
+- every qualification answer that produced the quote
+- the line breakdown and total
+- Approve, edit-then-approve, or reject
+
+Editing the price keeps the original visible struck through, so the change is
+never silent. On approval, the figure enters the chat marked **APPROVED BY
+OWNER**. On rejection, the customer is told the team will follow up — no price,
+no silence.
+
+Escalations work identically: the owner types an answer and it reaches the
+customer directly, under the same approval badge.
+
+**Why JSON rather than parsing the prose.** The obvious alternative is to let
+the model write normally and regex out any `£` figures. That fails in both
+directions — it misses "two hundred and eighty pounds" and it mangles replies
+that legitimately mention the FAQ's prices. Making the model declare its intent
+moves the decision from pattern-matching to a contract. And when the model
+drifts off-schema, `parseAgentAction` falls back to treating the output as a
+plain reply, so the failure mode is ordinary conversation rather than a broken
+chat.
+
 ---
 
 ## 5. Diagrams
@@ -186,13 +240,16 @@ Vercel's runtime logs. §6 shows why that logging mattered.
 ```mermaid
 flowchart TB
     subgraph browser["Browser"]
-        UI["page.tsx<br/>mode + business selection"]
-        CW["ChatWindow.tsx<br/>SSE reader, message state"]
+        UI["page.tsx<br/>navigation + quote/escalation state"]
+        CW["ChatWindow.tsx<br/>customer pane — SSE reader"]
         AS["AgentSteps.tsx<br/>live step list"]
         IC["ProductCard.tsx<br/>matched item cards"]
+        OI["OwnerInbox.tsx<br/>owner pane — approve, edit, reply"]
         CW --> AS
         CW --> IC
         UI --> CW
+        UI --> OI
+        OI -->|"approved price / owner reply"| CW
     end
 
     subgraph vercel["Vercel — one Next.js deployable"]
@@ -242,21 +299,40 @@ flowchart TD
     O -->|"503 / transient"| P["Retry, then next model<br/>in the fallback chain"]
     P --> O
     O -->|"All models failed"| ERR
-    O -->|Yes| Q["Emit: matched items"]
-    Q --> R["Emit: reply text"]
-    R --> S["Emit: done, close stream"]
+    O -->|Yes| ACT{"Which action did<br/>the agent return?"}
+
+    ACT -->|reply| R["Emit reply text"]
+    ACT -->|quote| QB["Build quote from rate card<br/>emit quote to owner inbox"]
+    ACT -->|escalate| EB["Emit escalation<br/>to owner inbox"]
+
+    QB --> HOLD["Customer sees hold message<br/>NO price in the chat"]
+    EB --> HOLD
+    HOLD --> OWN{"Owner acts"}
+    OWN -->|"Approve"| SEND["Price enters chat<br/>marked APPROVED BY OWNER"]
+    OWN -->|"Edit then approve"| SEND
+    OWN -->|"Reject"| FOLLOW["Customer told the team<br/>will follow up"]
+    OWN -->|"Reply to escalation"| SEND
+
+    R --> S["Emit done, close stream"]
+    SEND --> S
+    FOLLOW --> S
     ERR --> S
     S --> T["UI renders steps, cards and bubble"]
 
     style ERR fill:#3a1a1a,color:#e8e8f0
+    style HOLD fill:#2a2213,color:#e8e8f0
+    style SEND fill:#13261a,color:#e8e8f0
 ```
+
+The two shaded paths are the point: **nothing reaches the customer from the
+amber box until a human has acted on it.**
 
 ### 5.3 Use case diagram
 
 ```mermaid
 flowchart LR
     CUST(["Customer"])
-    OWNER(["Business owner<br/>— not yet built"])
+    OWNER(["Business owner"])
     GEMINI(["Gemini API"])
 
     subgraph sys["Rivon Agent"]
@@ -267,9 +343,14 @@ flowchart LR
         U5["Ask a policy or FAQ question"]
         U6["Describe a service need"]
         U7["Answer qualification questions"]
-        U8["Receive an estimate range"]
+        U8["Receive an approved price"]
         U9["Watch the agent's reasoning steps"]
-        U10["Approve a quote before it is sent"]
+
+        O1["Review a pending quote<br/>with the answers behind it"]
+        O2["Change the price before approving"]
+        O3["Approve — price reaches the customer"]
+        O4["Reject — customer told of follow-up"]
+        O5["Answer an escalated question"]
     end
 
     CUST --> U1
@@ -282,23 +363,25 @@ flowchart LR
     CUST --> U8
     CUST --> U9
 
-    OWNER -.-> U10
+    OWNER --> O1
+    OWNER --> O2
+    OWNER --> O3
+    OWNER --> O4
+    OWNER --> O5
+
+    O3 --> U8
+    O5 --> U8
 
     U3 --> GEMINI
     U4 --> GEMINI
     U5 --> GEMINI
     U6 --> GEMINI
     U7 --> GEMINI
-    U8 --> GEMINI
-
-    style U10 stroke-dasharray: 5 5
-    style OWNER stroke-dasharray: 5 5
 ```
 
-The owner approval path is drawn because it is the design's central rule, but
-it is **not implemented** — the agent currently states that the owner approves,
-without an owner-facing surface existing yet. That is the most important gap in
-the system (§7).
+Note that the customer's "receive an approved price" case is reachable **only**
+through the owner's approve or reply cases. There is no edge from the agent to a
+price.
 
 ### 5.4 Event sequence
 
@@ -329,6 +412,38 @@ sequenceDiagram
     API-->>UI: content
     API-->>UI: done
     UI->>C: steps, item cards, reply
+```
+
+### 5.5 The approval loop
+
+```mermaid
+sequenceDiagram
+    participant C as Customer
+    participant UI as ChatWindow
+    participant API as /api/chat
+    participant G as Gemini
+    participant IB as OwnerInbox
+    participant O as Owner
+
+    C->>UI: "3 bed, end of tenancy, M14 6AB — price?"
+    UI->>API: message + history
+    API->>G: system prompt with rate card
+    G-->>API: {"action":"quote", lines:[...], reply:"details are with the team"}
+    API-->>UI: quote event (lines, total £280)
+    API-->>UI: content — the hold message, no number
+    UI->>IB: add pending quote
+    UI->>C: hold message + "Awaiting confirmation"
+    Note over C: customer has seen no price
+
+    O->>IB: reviews answers and line breakdown
+    alt Owner edits the price
+        O->>IB: changes £280 to £310
+        IB->>IB: keep £280 visible, struck through
+    end
+    O->>IB: Approve
+    IB->>UI: pushOwnerMessage(approved price)
+    UI->>C: "£310 — would you like to book?"
+    Note over C: price arrives only now,<br/>badged APPROVED BY OWNER
 ```
 
 ---
@@ -414,18 +529,39 @@ Nothing here is an oversight. Each is a decision about sequencing.
 |---|---|---|
 | **No database** | Ten businesses, ~70 items total, all read-only. A database would add deploy surface and migration work for data that currently never changes. | Postgres or DynamoDB, tenant-scoped. The lookup in §4.1 becomes a query; nothing else moves. |
 | **No conversation persistence** | State lives in React and dies on refresh. For a demo that is fine, and it keeps the data model out of the way. | Needed before any real channel, because WhatsApp conversations span days. |
-| **No owner approval UI** | The agent *says* the owner approves. There is no owner surface. | The single most important gap. The design's central rule is currently enforced only by prompt. |
+| **Owner inbox is not a real inbox** | Built and working (§4.5), but it lives beside the chat in one browser tab and clears on refresh. | A real owner is on their phone, hours later. Needs persistence, auth, and a push notification. |
 | **No channel adapters** | Blocked on Meta Business Verification and App Review. | A webhook per channel that normalises the inbound payload and calls the same pipeline. |
 | **Naive retrieval** | Substring matching is exact and instant at this size. | Embeddings when catalogues reach hundreds of items. |
 | **No auth, no rate limiting** | Public demo, no customer data, no writes. | Both are required before this handles real traffic. |
 
-The honest summary: **the conversational layer is real and the surrounding
-platform is not.** That is the right order for the problem — the conversation
-was the part nobody had been able to test.
+The honest summary: **the conversational layer and the approval rule are real;
+the surrounding platform is not.** That is the right order for the problem — the
+conversation was the part nobody had been able to test, and the approval rule is
+the part the whole product depends on being true.
 
 ---
 
-## 8. Running it
+## 8. Seeing the approval loop in thirty seconds
+
+Open https://rivon-agent.vercel.app and:
+
+1. **Service Booking** → **BrightHome Cleaning**
+2. Send: *"How much for end of tenancy cleaning?"* — it asks qualification
+   questions instead of quoting.
+3. Answer them: *"3 bedrooms, one-off, no pets, M14 6AB"*
+4. The chat says the details are with the team. **No price appears.** A quote
+   for £280 appears in the owner inbox on the right, with the answers that
+   produced it.
+5. Press the pencil, change it to £310, approve. The customer now sees £310,
+   badged APPROVED BY OWNER.
+
+For escalation, try: *"Can you clean a hoarder property with biohazard waste?"*
+That is outside the rate card, so it goes to the owner as a question rather than
+being guessed at. Type an answer in the inbox and it reaches the customer.
+
+---
+
+## 9. Running it
 
 ```bash
 git clone https://github.com/syedd176/rivon-agent
@@ -450,7 +586,7 @@ printf 'your_key_here' | npx vercel env add GEMINI_API_KEY production
 
 ---
 
-## 9. File map
+## 10. File map
 
 ```
 app/
@@ -460,28 +596,31 @@ app/
   api/chat/route.ts     The entire backend — prompt, retrieval, SSE, fallback
 
 components/
-  ChatWindow.tsx        Message state, SSE reader, input, suggested questions
+  ChatWindow.tsx        Customer pane — message state, SSE reader, hold chips
+  OwnerInbox.tsx        Owner pane — pending quotes, price editing, escalations
   AgentSteps.tsx        Renders the live step list with status icons
   ProductCard.tsx       Matched item cards, handles products and services
 
 lib/
   data.ts               All catalogue data — 5 stores, 5 providers, FAQs, policies
+  quotes.ts             Quote and escalation types, status model
 ```
 
-Four files carry the real logic: `route.ts` is the backend, `ChatWindow.tsx` is
-the client half of the streaming protocol, `data.ts` is the content, and
-`page.tsx` is navigation. Everything else is presentation.
+Five files carry the real logic: `route.ts` is the backend and the action
+schema, `ChatWindow.tsx` and `OwnerInbox.tsx` are the two halves of the approval
+loop, `data.ts` is the content, and `page.tsx` holds the quote state that
+connects the two panes.
 
 ---
 
-## 10. Suggested next steps
+## 11. Suggested next steps
 
 In the order that gets the most value per unit of work:
 
-1. **Build the owner approval surface.** The pricing rule is the design's
-   foundation and is currently enforced only by prompt. A queue of pending
-   quotes with approve/edit/reject would make it real.
-2. **Persist conversations.** Everything else that matters depends on this.
+1. **Persist conversations and the owner queue.** The approval loop works but
+   lives in one browser tab. A real owner approves from their phone, hours
+   later, which needs storage, auth, and a notification. Everything else that
+   matters depends on this too.
 3. **Define the `requirements.extracted` payload.** `CONTEXT.md` §6 flags this
    as unassigned and both teams are guessing without it. This project now has a
    working agent that could produce a first draft of that shape from real
