@@ -2,15 +2,13 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { Zap, ChevronRight, ChevronLeft, ShoppingBag, Wrench, PanelRight } from "lucide-react";
-import { ChatWindow, ChatHandle } from "@/components/ChatWindow";
+import { ChatWindow, ChatHandle, RestoredMessage } from "@/components/ChatWindow";
 import { OwnerInbox } from "@/components/OwnerInbox";
 import { businesses, serviceBusinesses } from "@/lib/data";
 import { InboxItem, isQuote } from "@/lib/quotes";
 import { Lead } from "@/lib/leads";
 
 type Mode = "product" | "service";
-
-type RestoredMessage = { role: "user" | "assistant"; content: string; ownerApproved?: boolean };
 
 export default function Home() {
   const [mode, setMode] = useState<Mode | null>(null);
@@ -20,6 +18,7 @@ export default function Home() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [restored, setRestored] = useState<RestoredMessage[] | undefined>();
   const [mobilePane, setMobilePane] = useState<"chat" | "inbox">("chat");
+  const [liveConnected, setLiveConnected] = useState(false);
   const chatRef = useRef<ChatHandle>(null);
 
   /** Pulls this browser's conversation plus every lead for the business. */
@@ -37,9 +36,41 @@ export default function Home() {
     }
   }, []);
 
+  // Initial load restores this browser's conversation.
   useEffect(() => {
     if (bizId && mode) refresh(bizId, mode, true);
   }, [bizId, mode, refresh]);
+
+  /**
+   * Live feed. The owner sees other visitors arrive without reloading, and a
+   * customer's own tab picks up an owner reply the same way. EventSource
+   * reconnects by itself, so a closed stream needs no handling here.
+   */
+  useEffect(() => {
+    if (!bizId) return;
+    const es = new EventSource(`/api/live?bizId=${bizId}`);
+
+    es.onopen = () => setLiveConnected(true);
+    es.onerror = () => setLiveConnected(false);
+
+    es.onmessage = e => {
+      try {
+        const data = JSON.parse(e.data);
+        setLiveConnected(true);
+        if (data.type !== "snapshot") return;
+        setSessionId(data.viewerSessionId);
+        setLeads(data.leads ?? []);
+        setItems(data.inbox ?? []);
+        if (Array.isArray(data.myMessages)) {
+          chatRef.current?.syncMessages(data.myMessages);
+        }
+      } catch {
+        // Ignore a malformed frame; the next snapshot supersedes it.
+      }
+    };
+
+    return () => es.close();
+  }, [bizId]);
 
   const reset = () => {
     setBizId(null);
@@ -49,9 +80,9 @@ export default function Home() {
     setMobilePane("chat");
   };
 
-  const onTurnComplete = useCallback(() => {
-    if (bizId && mode) refresh(bizId, mode);
-  }, [bizId, mode, refresh]);
+  // The live feed picks up the new turn within a couple of seconds, so there
+  // is nothing to do here beyond letting it arrive.
+  const onTurnComplete = useCallback(() => {}, []);
 
   /** Owner actions go through the API so the change persists for everyone. */
   const ownerAct = useCallback(async (
@@ -70,12 +101,12 @@ export default function Home() {
     if (!res.ok) return;
     const data = await res.json();
 
-    // Only this browser's own chat updates live; other visitors see it on reload.
+    // Applied straight away when the owner is approving their own chat, so the
+    // demo feels instant. Other visitors get it from the live feed.
     if (data.customerMessage && targetSessionId === sessionId) {
       chatRef.current?.pushOwnerMessage(data.customerMessage);
     }
-    if (mode) refresh(bizId, mode);
-  }, [bizId, mode, sessionId, refresh]);
+  }, [bizId, sessionId]);
 
   const approveQuote = useCallback((id: string, finalTotal: number) => {
     const item = items.find(i => i.id === id);
@@ -152,9 +183,17 @@ export default function Home() {
               )}
             </button>
           )}
-          <div className="hidden sm:flex items-center gap-1.5">
-            <div className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--green)", animation: "pulse-dot 2s infinite" }} />
-            <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>Live</span>
+          <div className="hidden sm:flex items-center gap-1.5" title={liveConnected ? "Live updates connected" : "Reconnecting…"}>
+            <div
+              className="w-1.5 h-1.5 rounded-full"
+              style={{
+                background: liveConnected ? "var(--green)" : "var(--text-muted)",
+                animation: liveConnected ? "pulse-dot 2s infinite" : "none",
+              }}
+            />
+            <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
+              {liveConnected ? "Live" : "Connecting"}
+            </span>
           </div>
         </div>
       </header>

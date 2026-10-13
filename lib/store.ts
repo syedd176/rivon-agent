@@ -31,6 +31,11 @@ export interface Store {
   saveSession(rec: SessionRecord): Promise<void>;
   /** Every session for a business — this is what the owner sidebar lists. */
   listSessions(bizId: string): Promise<SessionRecord[]>;
+  /**
+   * Cheap change watermark: latest updated_at plus a row count, so the live
+   * stream can tell whether anything moved without fetching every session.
+   */
+  watermark(bizId: string): Promise<string>;
 }
 
 // ── In-memory fallback ────────────────────────────────────────────────────────
@@ -49,6 +54,11 @@ const memoryStore: Store = {
     return [...mem.values()]
       .filter(r => r.bizId === bizId)
       .sort((a, b) => b.updatedAt - a.updatedAt);
+  },
+  async watermark(bizId) {
+    const rows = [...mem.values()].filter(r => r.bizId === bizId);
+    const latest = rows.reduce((max, r) => Math.max(max, r.updatedAt), 0);
+    return `${rows.length}:${latest}`;
   },
 };
 
@@ -130,6 +140,16 @@ function getPgStore(): Store {
         ORDER BY updated_at DESC LIMIT 50
       `) as Row[];
       return rows.map(toRecord);
+    },
+
+    async watermark(bizId) {
+      await ensureSchema();
+      const rows = (await sql`
+        SELECT COUNT(*)::int AS n, COALESCE(MAX(updated_at), 0) AS latest
+        FROM sessions WHERE biz_id = ${bizId}
+      `) as { n: number; latest: string | number }[];
+      const r = rows[0];
+      return `${r?.n ?? 0}:${Number(r?.latest ?? 0)}`;
     },
   };
 

@@ -24,6 +24,14 @@ export type ChatHandle = {
   pushOwnerMessage: (text: string) => void;
   /** Clear the hold chip once the owner has acted. */
   clearAwaiting: () => void;
+  /** Reconcile against the server's copy, from the live feed. */
+  syncMessages: (stored: RestoredMessage[]) => void;
+};
+
+export type RestoredMessage = {
+  role: "user" | "assistant";
+  content: string;
+  ownerApproved?: boolean;
 };
 
 const PRODUCT_QUICK: Record<string, string[]> = {
@@ -55,7 +63,7 @@ type Props = {
   /** Fires after each turn so the owner sidebar can refresh. */
   onTurnComplete?: () => void;
   /** Conversation restored from storage; replaces the welcome message. */
-  restored?: { role: "user" | "assistant"; content: string; ownerApproved?: boolean }[];
+  restored?: RestoredMessage[];
 };
 
 export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
@@ -69,6 +77,10 @@ export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // Read inside the imperative handle, which does not see `loading` directly.
+  const loadingRef = useRef(false);
+
+  useEffect(() => { loadingRef.current = loading; }, [loading]);
 
   // Replay a stored conversation once it arrives.
   useEffect(() => {
@@ -87,13 +99,34 @@ export const ChatWindow = forwardRef<ChatHandle, Props>(function ChatWindow(
 
   useImperativeHandle(ref, () => ({
     pushOwnerMessage: (text: string) => {
-      setMessages(prev => [
-        ...prev.map(m => ({ ...m, awaiting: false })),
-        { id: `owner-${Date.now()}`, role: "assistant", content: text, ownerApproved: true },
-      ]);
+      setMessages(prev => {
+        if (prev.some(m => m.ownerApproved && m.content === text)) return prev;
+        return [
+          ...prev.map(m => ({ ...m, awaiting: false })),
+          { id: `owner-${Date.now()}`, role: "assistant", content: text, ownerApproved: true },
+        ];
+      });
     },
     clearAwaiting: () => {
       setMessages(prev => prev.map(m => ({ ...m, awaiting: false })));
+    },
+    syncMessages: (stored: RestoredMessage[]) => {
+      // Append only what the server has and this tab does not. A live snapshot
+      // can arrive mid-stream, and replacing wholesale would wipe the reply
+      // currently being written.
+      setMessages(prev => {
+        if (loadingRef.current) return prev;
+        const real = prev.filter(m => m.id !== "welcome");
+        if (stored.length <= real.length) return prev;
+
+        const extra = stored.slice(real.length).map((m, i) => ({
+          id: `sync-${real.length + i}`,
+          role: m.role,
+          content: m.content,
+          ownerApproved: m.ownerApproved,
+        }));
+        return [...prev.map(m => ({ ...m, awaiting: false })), ...extra];
+      });
     },
   }), []);
 
